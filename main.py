@@ -1,324 +1,339 @@
 #!/usr/bin/env python3
+"""Cutest-picture entry, v2: an extreme close-up of a chubby baby kitten.
+
+Design goals (from the brief): cute at one glance, soft round shapes,
+huge glossy eyes, chubby proportions, exactly one charm touch (a tiny
+pink bow), clean craft, and a composition bold enough to still read as
+cute when the image is downscaled to about 300 px.
+
+Pure Python standard library, no network, fully deterministic.
+Renders one PNG to argv[1] (default /output/entry.png).
+
+Technique: a float framebuffer painted with signed-distance shapes.
+Every edge is anti-aliased from its distance field, so curves stay
+smooth without any supersampling cost.
 """
-Make the cutest picture - make.fun bounty entry.
-A chubby round kitten with huge glossy eyes, blush, soft pastel palette.
-Pure Python stdlib only. Manual PNG encoder (zlib + struct).
-Deterministic: no randomness, no timestamps, fixed math only.
-"""
-import sys
-import os
+
 import math
-import zlib
+import os
 import struct
+import sys
+import zlib
 
 W = 800
 H = 800
 
-# ---------- Framebuffer ----------
-fb = bytearray(W * H * 3)
+# Float framebuffer, one flat list per channel.
+FR = [0.0] * (W * H)
+FG = [0.0] * (W * H)
+FB = [0.0] * (W * H)
 
-def set_px(x, y, r, g, b):
-    if 0 <= x < W and 0 <= y < H:
-        i = (y * W + x) * 3
-        fb[i] = r; fb[i+1] = g; fb[i+2] = b
 
-def blend_px(x, y, r, g, b, a):
-    """a in 0..1 : 1 = opaque new color"""
-    if 0 <= x < W and 0 <= y < H and a > 0:
-        if a >= 1.0:
-            set_px(x, y, r, g, b)
-            return
-        i = (y * W + x) * 3
-        inv = 1.0 - a
-        fb[i]   = int(fb[i]   * inv + r * a)
-        fb[i+1] = int(fb[i+1] * inv + g * a)
-        fb[i+2] = int(fb[i+2] * inv + b * a)
+def clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
 
-def get_px(x, y):
-    i = (y * W + x) * 3
-    return fb[i], fb[i+1], fb[i+2]
 
-# ---------- Shapes ----------
-def filled_circle(cx, cy, r, color, soft=1.5):
-    cr, cg, cb = color
-    x0 = int(cx - r - 2); x1 = int(cx + r + 2)
-    y0 = int(cy - r - 2); y1 = int(cy + r + 2)
-    for y in range(max(0, y0), min(H, y1+1)):
-        for x in range(max(0, x0), min(W, x1+1)):
-            d = math.hypot(x - cx, y - cy)
-            if d <= r - soft:
-                set_px(x, y, cr, cg, cb)
-            elif d <= r + soft:
-                a = 0.5 - (d - r) / (2*soft)
-                blend_px(x, y, cr, cg, cb, max(0.0, min(1.0, a + 0.5 if False else (r + soft - d)/(2*soft))))
+def lerp(a, b, t):
+    return a + (b - a) * t
 
-def filled_ellipse(cx, cy, rx, ry, color, soft=1.5):
-    cr, cg, cb = color
-    x0 = int(cx - rx - 2); x1 = int(cx + rx + 2)
-    y0 = int(cy - ry - 2); y1 = int(cy + ry + 2)
-    for y in range(max(0, y0), min(H, y1+1)):
-        for x in range(max(0, x0), min(W, x1+1)):
-            dx = (x - cx) / rx; dy = (y - cy) / ry
-            d = dx*dx + dy*dy
-            if d <= 0.92:
-                set_px(x, y, cr, cg, cb)
-            elif d <= 1.08:
-                a = (1.08 - d) / 0.16
-                blend_px(x, y, cr, cg, cb, max(0.0, min(1.0, a)))
 
-def filled_ellipse_alpha(cx, cy, rx, ry, color, alpha):
-    cr, cg, cb = color
-    x0 = int(cx - rx - 1); x1 = int(cx + rx + 1)
-    y0 = int(cy - ry - 1); y1 = int(cy + ry + 1)
-    for y in range(max(0, y0), min(H, y1+1)):
-        for x in range(max(0, x0), min(W, x1+1)):
-            dx = (x - cx) / rx; dy = (y - cy) / ry
-            if dx*dx + dy*dy <= 1.0:
-                blend_px(x, y, cr, cg, cb, alpha)
+def lerp3(c1, c2, t):
+    return (lerp(c1[0], c2[0], t),
+            lerp(c1[1], c2[1], t),
+            lerp(c1[2], c2[2], t))
 
-def polygon(points, color):
-    cr, cg, cb = color
-    xs = [p[0] for p in points]; ys = [p[1] for p in points]
-    x0 = int(min(xs)); x1 = int(max(xs)); y0 = int(min(ys)); y1 = int(max(ys))
-    n = len(points)
-    for y in range(max(0, y0), min(H, y1+1)):
-        for x in range(max(0, x0), min(W, x1+1)):
-            # point in polygon (ray casting)
-            inside = False
-            j = n - 1
-            for i in range(n):
-                xi, yi = points[i]; xj, yj = points[j]
-                if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi):
-                    inside = not inside
-                j = i
-            if inside:
-                set_px(x, y, cr, cg, cb)
 
-def thick_line(x0, y0, x1, y1, width, color):
-    cr, cg, cb = color
-    steps = int(max(abs(x1-x0), abs(y1-y0))) + 1
-    r = width / 2.0
-    for s in range(steps+1):
-        t = s / steps if steps else 0
-        cx = x0 + (x1-x0)*t; cy = y0 + (y1-y0)*t
-        filled_circle(cx, cy, r, color, soft=1.0)
+def smooth(t):
+    t = clamp(t)
+    return t * t * (3.0 - 2.0 * t)
 
-def draw_heart(cx, cy, s, color):
-    # s = scale; heart via two circles + triangle polygon
-    filled_circle(cx - s*0.45, cy - s*0.25, s*0.52, color, soft=1.2)
-    filled_circle(cx + s*0.45, cy - s*0.25, s*0.52, color, soft=1.2)
-    polygon([(cx - s*0.88, cy - s*0.05), (cx + s*0.88, cy - s*0.05), (cx, cy + s*1.05)], color)
 
-def draw_star(cx, cy, r, color, alpha=0.9):
-    # 4-point sparkle star
-    pts = []
-    for i in range(8):
-        ang = math.pi/4 * i
-        rad = r if i % 2 == 0 else r*0.28
-        pts.append((cx + math.cos(ang)*rad, cy + math.sin(ang)*rad))
-    # draw via polygon with blending approximated by solid then smaller?
-    # Use polygon solid with alpha by blending each pixel manually: fallback solid
-    polygon(pts, color)
+def blend_px(i, col, a):
+    """Alpha-blend colour `col` over framebuffer pixel `i`."""
+    if a <= 0.0:
+        return
+    ia = 1.0 - a
+    FR[i] = FR[i] * ia + col[0] * a
+    FG[i] = FG[i] * ia + col[1] * a
+    FB[i] = FB[i] * ia + col[2] * a
 
-# ---------- Scene ----------
-def draw():
-    # Background: vertical pastel gradient cream -> pink -> mint hint at bottom
-    top = (255, 243, 224)     # warm cream
-    mid = (255, 214, 232)     # soft pink
-    bot = (198, 240, 224)     # mint
+
+def background():
+    """Soft pastel backdrop: warm cream melting into pink, vignetted."""
+    top = (1.000, 0.949, 0.878)
+    mid = (1.000, 0.851, 0.902)
+    bot = (0.984, 0.749, 0.851)
     for y in range(H):
         t = y / (H - 1)
         if t < 0.55:
-            k = t / 0.55
-            r = int(top[0] + (mid[0]-top[0])*k)
-            g = int(top[1] + (mid[1]-top[1])*k)
-            b = int(top[2] + (mid[2]-top[2])*k)
+            c = lerp3(top, mid, smooth(t / 0.55))
         else:
-            k = (t - 0.55) / 0.45
-            r = int(mid[0] + (bot[0]-mid[0])*k)
-            g = int(mid[1] + (bot[1]-mid[1])*k)
-            b = int(mid[2] + (bot[2]-mid[2])*k)
-        base = y * W * 3
+            c = lerp3(mid, bot, smooth((t - 0.55) / 0.45))
+        base = y * W
         for x in range(W):
-            i = base + x*3
-            fb[i] = r; fb[i+1] = g; fb[i+2] = b
+            dx = (x - W / 2) / (W / 2)
+            dy = (y - H / 2) / (H / 2)
+            v = 1.0 - 0.15 * clamp(dx * dx + dy * dy - 0.55)
+            i = base + x
+            FR[i] = c[0] * v
+            FG[i] = c[1] * v
+            FB[i] = c[2] * v
 
-    # Soft bokeh dots (fixed positions)
-    bokeh = [(110,120,42,(255,255,255)), (680,110,36,(255,255,255)), (720,300,24,(255,255,255)),
-             (70,340,26,(255,255,255)), (150,620,30,(255,255,255)), (660,640,34,(255,255,255)),
-             (580,80,20,(255,220,240)), (210,90,18,(255,220,240))]
-    for (x,y,r,c) in bokeh:
-        filled_ellipse_alpha(x, y, r, r, c, 0.35)
-
-    # Ground shadow + soft grass mound
-    filled_ellipse(400, 682, 290, 62, (178, 232, 205), soft=2)
-    filled_ellipse_alpha(400, 688, 215, 30, (90, 160, 120), 0.22)
-
-    # Tail (behind body, curled on right)
-    # thick curved tail approximated by circles along arc
-    for i in range(21):
-        t = i / 20.0
-        ang = -0.9 + t * 1.9
-        cx = 545 + math.cos(ang) * 95
-        cy = 625 + math.sin(ang) * 42
-        filled_circle(cx, cy, 26, (224, 138, 82), soft=1.2)
-    for i in range(21):
-        t = i / 20.0
-        ang = -0.9 + t * 1.9
-        cx = 545 + math.cos(ang) * 95
-        cy = 625 + math.sin(ang) * 42
-        filled_circle(cx, cy, 19, (255, 183, 120), soft=1.2)
-    # tail tip
-    filled_circle(632, 600, 20, (255, 240, 220))
-
-    OUTLINE = (146, 92, 62)
-    FUR = (255, 183, 120)       # peach-orange
-    FUR_LIGHT = (255, 214, 165)
-    CREAM = (255, 242, 225)
-
-    # Ears (outline then fur then inner pink) - rounded triangles via polygons + circles at tips
-    # Left ear
-    polygon([(272,238),(218,92),(368,150)], OUTLINE)
-    polygon([(276,224),(232,112),(352,158)], FUR)
-    polygon([(278,196),(252,136),(322,162)], (255, 158, 182))
-    filled_circle(232, 112, 16, FUR)
-    # Right ear
-    polygon([(528,238),(582,92),(432,150)], OUTLINE)
-    polygon([(524,224),(568,112),(448,158)], FUR)
-    polygon([(522,196),(548,136),(478,162)], (255, 158, 182))
-    filled_circle(568, 112, 16, FUR)
-
-    # Body (chubby, behind head)
-    filled_ellipse(400, 618, 172, 118, OUTLINE)
-    filled_ellipse(400, 618, 162, 108, FUR)
-    filled_ellipse(400, 632, 100, 76, CREAM)  # belly
-
-    # Head (big round)
-    filled_circle(400, 368, 198, OUTLINE)
-    filled_circle(400, 368, 188, FUR)
-    # Forehead / muzzle cream patch
-    filled_ellipse(400, 438, 118, 82, CREAM)
-    filled_ellipse(400, 300, 130, 92, FUR_LIGHT)
-    filled_ellipse(400, 438, 118, 82, CREAM)
-
-    # Orange tabby stripes on forehead (soft short thick lines)
-    for (x0,y0,x1,y1) in [(368,196,362,238),(400,188,400,232),(432,196,438,238)]:
-        thick_line(x0,y0,x1,y1,13,(232,148,88))
-    # Cheek patches
-    filled_ellipse_alpha(252, 410, 34, 48, (255,214,165), 0.55)
-    filled_ellipse_alpha(548, 410, 34, 48, (255,214,165), 0.55)
-
-    # Blush (big, soft pink)
-    filled_ellipse_alpha(268, 452, 46, 26, (255, 110, 155), 0.55)
-    filled_ellipse_alpha(532, 452, 46, 26, (255, 110, 155), 0.55)
-    filled_ellipse_alpha(268, 452, 30, 16, (255, 130, 170), 0.5)
-    filled_ellipse_alpha(532, 452, 30, 16, (255, 130, 170), 0.5)
-
-    # HUGE glossy eyes
-    for ecx in (322, 478):
-        # white sclera hint / outline
-        filled_circle(ecx, 378, 52, (92, 52, 38))
-        filled_circle(ecx, 378, 47, (52, 32, 28))       # dark iris base
-        filled_circle(ecx, 382, 40, (78, 44, 32))        # warm brown iris
-        filled_circle(ecx, 386, 27, (28, 18, 16))        # pupil
-        # glossy highlights (key for cuteness + readability at 300px)
-        filled_circle(ecx - 14, 362, 14, (255,255,255))
-        filled_circle(ecx + 12, 392, 8, (255,255,255))
-        filled_circle(ecx + 16, 360, 5, (180, 230, 255))
-        # lower sparkle
-        filled_circle(ecx - 4, 402, 4, (255,255,255))
-    # Upper eyelid lash hint: small arc of dark circles along top of eyes
-    for ecx in (322, 478):
-        for i in range(9):
-            ang = math.pi * (1.08 + 0.84 * (i/8.0))  # top arc
-            lx = ecx + math.cos(ang) * 50
-            ly = 378 + math.sin(ang) * 50
-            filled_circle(lx, ly, 5, (92,52,38), soft=1.0)
-
-    # Tiny eyebrows raised (cute surprise)
-    thick_line(288, 302, 342, 290, 7, (146,92,62))
-    thick_line(458, 290, 514, 302, 7, (146,92,62))
-
-    # Nose: small pink heart-ish triangle
-    polygon([(386,428),(414,428),(400,446)], (240, 100, 130))
-    filled_circle(393, 429, 7, (240,100,130)); filled_circle(407, 429, 7, (240,100,130))
-    filled_circle(396, 426, 3, (255,200,215))
-
-    # Mouth: tiny 'w' - two small arcs approximated by thick lines
-    thick_line(400, 446, 382, 458, 6, (146,92,62))
-    thick_line(382, 458, 368, 448, 6, (146,92,62))
-    thick_line(400, 446, 418, 458, 6, (146,92,62))
-    thick_line(418, 458, 432, 448, 6, (146,92,62))
-    # tiny open smile tongue
-    filled_ellipse(400, 462, 12, 8, (255,150,170))
-
-    # Whiskers (thin, soft brown)
-    for (x0,y0,x1,y1) in [(238,432,168,420),(240,452,172,458),(242,472,182,492),
-                          (562,432,632,420),(560,452,628,458),(558,472,618,492)]:
-        thick_line(x0,y0,x1,y1,4,(178,130,95))
-
-    # Paws (front, chubby, with toe beans)
-    for pcx in (312, 488):
-        filled_ellipse(pcx, 690, 58, 36, OUTLINE)
-        filled_ellipse(pcx, 688, 52, 30, FUR_LIGHT)
-        # toe lines
-        thick_line(pcx-18, 672, pcx-18, 686, 5, (196,130,85))
-        thick_line(pcx+18, 672, pcx+18, 686, 5, (196,130,85))
-        # pink pad
-        filled_ellipse(pcx, 696, 14, 9, (255,158,182))
-
-    # Small bell collar
-    for i in range(25):
-        t = i/24.0
-        ang = 0.35 + t * (math.pi - 0.70)
-        cx = 400 + math.cos(ang)*132
-        cy = 500 + math.sin(ang)*58
-        filled_circle(cx, cy, 10, (110, 200, 220), soft=1.0)
-    filled_circle(400, 566, 20, (255, 202, 64))
-    filled_circle(400, 566, 20, (255, 202, 64))
-    filled_circle(394, 559, 6, (255,255,255))
-    thick_line(400, 572, 400, 582, 4, (180,130,30))
-    filled_circle(400, 570, 4, (120,85,20))
-
-    # Decor: floating hearts + sparkles (story/charm)
-    draw_heart(128, 232, 26, (255,110,160))
-    draw_heart(676, 238, 20, (255,140,180))
-    draw_heart(612, 168, 13, (255,110,160))
-    draw_star(168, 520, 20, (255,205,70))
-    draw_star(648, 500, 16, (255,205,70))
-    draw_star(560, 92, 14, (255,180,210))
-    # tiny flowers on ground
-    for (fx, fy) in [(150,692),(205,716),(610,712),(652,680)]:
-        for k in range(5):
-            ang = 2*math.pi*k/5
-            filled_circle(fx+math.cos(ang)*9, fy+math.sin(ang)*9, 7, (255,255,255), soft=1.0)
-        filled_circle(fx, fy, 6, (255,202,64), soft=1.0)
-
-# ---------- PNG encoder ----------
-def png_chunk(typ, data):
-    c = struct.pack(">I", len(data)) + typ + data
-    c += struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
-    return c
 
 def write_png(path):
     raw = bytearray()
     for y in range(H):
-        raw.append(0)  # filter None
-        start = y * W * 3
-        raw.extend(fb[start:start+W*3])
-    png = b"\x89PNG\r\n\x1a\n"
-    png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png += png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png += png_chunk(b"IEND", b"")
-    d = os.path.dirname(os.path.abspath(path))
-    os.makedirs(d, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(png)
+        raw.append(0)  # filter type 0 for every scanline
+        base = y * W
+        for x in range(W):
+            i = base + x
+            raw.append(int(clamp(FR[i]) * 255.0 + 0.5))
+            raw.append(int(clamp(FG[i]) * 255.0 + 0.5))
+            raw.append(int(clamp(FB[i]) * 255.0 + 0.5))
+    comp = zlib.compress(bytes(raw), 9)
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", comp)
+           + chunk(b"IEND", b""))
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+# ---------------------------------------------------------------------------
+# Distance-field shape primitives. Each one only visits its own bounding
+# box, blends with a coverage factor derived from the signed distance to
+# the shape's edge, and accepts an optional per-pixel colour function.
+# ---------------------------------------------------------------------------
+
+def ellipse(cx, cy, rx, ry, col, alpha=1.0, feather=1.4, rot=0.0,
+            colorfn=None):
+    """Filled ellipse; `feather` is the edge softness in pixels."""
+    cr = math.cos(rot)
+    sr = math.sin(rot)
+    reach = max(rx, ry) + feather * 2.0 + 2.0
+    x0 = max(0, int(cx - reach))
+    x1 = min(W - 1, int(cx + reach))
+    y0 = max(0, int(cy - reach))
+    y1 = min(H - 1, int(cy + reach))
+    mn = min(rx, ry)
+    for y in range(y0, y1 + 1):
+        py = y + 0.5 - cy
+        base = y * W
+        for x in range(x0, x1 + 1):
+            px = x + 0.5 - cx
+            if rot:
+                qx = px * cr + py * sr
+                qy = -px * sr + py * cr
+            else:
+                qx, qy = px, py
+            d = math.sqrt((qx / rx) * (qx / rx) + (qy / ry) * (qy / ry))
+            sd = (d - 1.0) * mn  # approximate signed distance, in pixels
+            cov = clamp(0.5 - sd / feather)
+            if cov <= 0.0:
+                continue
+            c = colorfn(x + 0.5, y + 0.5) if colorfn is not None else col
+            blend_px(base + x, c, cov * alpha)
+
+
+def capsule(x1, y1, x2, y2, r, col, alpha=1.0, feather=1.4):
+    """Thick round-capped line segment (used for the forehead stripes)."""
+    reach = r + feather * 2.0 + 2.0
+    x0 = max(0, int(min(x1, x2) - reach))
+    x1b = min(W - 1, int(max(x1, x2) + reach))
+    y0 = max(0, int(min(y1, y2) - reach))
+    y1b = min(H - 1, int(max(y1, y2) + reach))
+    dx = x2 - x1
+    dy = y2 - y1
+    seg2 = dx * dx + dy * dy
+    for y in range(y0, y1b + 1):
+        py = y + 0.5
+        base = y * W
+        for x in range(x0, x1b + 1):
+            px = x + 0.5
+            if seg2 > 0.0:
+                t = clamp(((px - x1) * dx + (py - y1) * dy) / seg2)
+            else:
+                t = 0.0
+            qx = x1 + dx * t
+            qy = y1 + dy * t
+            sd = math.hypot(px - qx, py - qy) - r
+            cov = clamp(0.5 - sd / feather)
+            if cov > 0.0:
+                blend_px(base + x, col, cov * alpha)
+
+
+def arc(cx, cy, r, a0, a1, width, col, alpha=1.0, feather=1.2):
+    """Ring segment between angles a0..a1 (radians, y-axis pointing down,
+    so angles in (0, pi) sweep the bottom half of the circle)."""
+    reach = r + width + feather * 2.0 + 2.0
+    x0 = max(0, int(cx - reach))
+    x1 = min(W - 1, int(cx + reach))
+    y0 = max(0, int(cy - reach))
+    y1 = min(H - 1, int(cy + reach))
+    half = width / 2.0
+    for y in range(y0, y1 + 1):
+        py = y + 0.5 - cy
+        base = y * W
+        for x in range(x0, x1 + 1):
+            px = x + 0.5 - cx
+            d = math.hypot(px, py)
+            sd = abs(d - r) - half
+            if sd > feather:
+                continue
+            ang = math.atan2(py, px)
+            if ang < a0 or ang > a1:
+                # allow the caps to round off near the segment ends
+                ea = min(abs(ang - a0), abs(ang - a1)) * r
+                if ea > half + feather:
+                    continue
+                sd = max(sd, ea - half)
+            cov = clamp(0.5 - sd / feather)
+            if cov > 0.0:
+                blend_px(base + x, col, cov * alpha)
+
+
+# ---------------------------------------------------------------------------
+# The kitten. Painted back to front: backdrop sparkles, ears, head,
+# shading, stripes, muzzle, blush, eyes, nose, mouth, and finally the
+# single charm touch -- a tiny pink bow on the right ear.
+# ---------------------------------------------------------------------------
+
+FUR = (0.992, 0.706, 0.427)       # warm orange-cream fur
+FUR_DEEP = (0.945, 0.545, 0.235)  # stripe orange
+CREAM = (1.000, 0.937, 0.835)     # muzzle cream
+PINK = (1.000, 0.478, 0.639)      # bow / nose pink family
+
+
+def shade_head():
+    """Roundness for the head: a soft light from upper centre and a
+    gentle darkening toward the rim. Masked by the head ellipse."""
+    cx, cy, rx, ry = 400.0, 445.0, 335.0, 305.0
+    x0 = max(0, int(cx - rx - 2))
+    x1 = min(W - 1, int(cx + rx + 2))
+    y0 = max(0, int(cy - ry - 2))
+    y1 = min(H - 1, int(cy + ry + 2))
+    for y in range(y0, y1 + 1):
+        py = y + 0.5
+        base = y * W
+        for x in range(x0, x1 + 1):
+            px = x + 0.5
+            d = math.sqrt(((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2)
+            if d > 1.0:
+                continue
+            i = base + x
+            gx = (px - 400.0) / 300.0
+            gy = (py - 350.0) / 300.0
+            glow = math.exp(-(gx * gx + gy * gy))
+            rim = smooth((d - 0.80) / 0.20)
+            shade = 1.0 - 0.13 * rim
+            FR[i] = clamp(FR[i] * shade + 0.10 * glow)
+            FG[i] = clamp(FG[i] * shade + 0.085 * glow)
+            FB[i] = clamp(FB[i] * shade + 0.055 * glow)
+
+
+def draw_eye(cx, cy):
+    """One huge glossy eye: radial iris, dark pupil, amber crescent
+    along the bottom, then two catchlights and a tiny sparkle."""
+    R = 82.0
+
+    def iris(px, py):
+        d = math.hypot(px - cx, py - cy) / R
+        return lerp3((0.472, 0.298, 0.153), (0.118, 0.063, 0.035),
+                     smooth(d))
+
+    ellipse(cx, cy, R, R * 1.06, None, 1.0, 1.6, colorfn=iris)
+    # top lid shadow gives the eye a gentle, sleepy-cute weight
+    arc(cx, cy, R * 0.99, -math.pi * 0.92, -math.pi * 0.08, 15.0,
+        (0.10, 0.05, 0.03), 0.35, 6.0)
+    # pupil
+    ellipse(cx, cy + 5, 40, 49, (0.045, 0.027, 0.020), 1.0, 1.6)
+    # warm crescent reflection along the bottom of the iris
+    arc(cx, cy, R * 0.70, math.pi * 0.22, math.pi * 0.78, 8.0,
+        (0.98, 0.62, 0.28), 0.26, 3.5)
+    # catchlights
+    ellipse(cx - 27, cy - 33, 24, 24, (1.0, 1.0, 1.0), 0.96, 1.6)
+    ellipse(cx + 23, cy + 28, 11, 11, (1.0, 1.0, 1.0), 0.85, 1.4)
+    ellipse(cx + 31, cy - 41, 5, 5, (1.0, 1.0, 1.0), 0.90, 1.2)
+
+
+def draw_bow(cx, cy):
+    """The one charm touch: a small pink bow, drawn with a soft drop
+    shadow, two rotated wings, a knot, and a knot highlight."""
+    shadow = (0.55, 0.20, 0.32)
+    ellipse(cx - 34 + 4, cy + 6, 40, 24, shadow, 0.30, 2.5, rot=-0.45)
+    ellipse(cx + 34 + 4, cy + 6, 40, 24, shadow, 0.30, 2.5, rot=0.45)
+    wing_dark = (0.929, 0.337, 0.510)
+    ellipse(cx - 34, cy, 40, 24, wing_dark, 1.0, 1.6, rot=-0.45)
+    ellipse(cx + 34, cy, 40, 24, wing_dark, 1.0, 1.6, rot=0.45)
+    wing = (1.000, 0.478, 0.639)
+    ellipse(cx - 36, cy - 3, 33, 18, wing, 1.0, 1.6, rot=-0.45)
+    ellipse(cx + 36, cy - 3, 33, 18, wing, 1.0, 1.6, rot=0.45)
+    ellipse(cx, cy, 16, 15, (0.965, 0.302, 0.498), 1.0, 1.5)
+    ellipse(cx - 4, cy - 5, 6, 4, (1.0, 1.0, 1.0), 0.55, 1.2, rot=-0.4)
+
+
+def draw_kitten():
+    background()
+    # dreamy out-of-focus dots floating in the backdrop
+    ellipse(105, 118, 46, 46, (1.0, 1.0, 1.0), 0.16, 55.0)
+    ellipse(706, 84, 33, 33, (1.0, 1.0, 1.0), 0.14, 45.0)
+    ellipse(84, 648, 40, 40, (1.0, 1.0, 1.0), 0.11, 50.0)
+    ellipse(722, 668, 48, 48, (1.0, 1.0, 1.0), 0.11, 55.0)
+    # soft contact shadow under the chin
+    ellipse(400, 764, 295, 26, (0.83, 0.42, 0.52), 0.20, 26.0)
+
+    # ears, tucked in so they peek from behind the head rather than
+    # sticking out like lollipops
+    ellipse(140, 226, 94, 112, FUR, 1.0, 1.6, rot=-0.33)
+    ellipse(660, 226, 94, 112, FUR, 1.0, 1.6, rot=0.33)
+    ellipse(148, 234, 46, 62, (0.992, 0.639, 0.671), 0.90, 2.2, rot=-0.33)
+    ellipse(652, 234, 46, 62, (0.992, 0.639, 0.671), 0.90, 2.2, rot=0.33)
+
+    # the big round chubby head
+    ellipse(400, 445, 335, 305, FUR, 1.0, 1.6)
+    shade_head()
+
+    # faint tabby stripes on the forehead
+    capsule(400, 192, 400, 238, 12, FUR_DEEP, 0.26, 4.0)
+    capsule(350, 204, 336, 244, 11, FUR_DEEP, 0.22, 4.0)
+    capsule(450, 204, 464, 244, 11, FUR_DEEP, 0.22, 4.0)
+
+    # muzzle and blush
+    ellipse(400, 580, 152, 94, CREAM, 0.95, 2.0)
+    ellipse(168, 548, 58, 30, (1.0, 0.620, 0.710), 0.50, 26.0)
+    ellipse(632, 548, 58, 30, (1.0, 0.620, 0.710), 0.50, 26.0)
+
+    # huge glossy eyes
+    draw_eye(262, 415)
+    draw_eye(538, 415)
+
+    # tiny pink nose with a pinpoint highlight
+    ellipse(400, 548, 27, 19, (0.996, 0.475, 0.580), 1.0, 1.5)
+    ellipse(391, 541, 9, 5, (1.0, 1.0, 1.0), 0.55, 1.2, rot=-0.4)
+    # the little "w" kitten mouth under the nose
+    mouth = (0.663, 0.373, 0.263)
+    capsule(400, 562, 400, 574, 3, mouth, 0.55, 1.2)
+    arc(381, 574, 17, math.pi * 0.12, math.pi * 0.92, 4.5, mouth, 0.75, 1.2)
+    arc(419, 574, 17, math.pi * 0.08, math.pi * 0.88, 4.5, mouth, 0.75, 1.2)
+
+    # the single charm: a tiny bow riding the right ear
+    draw_bow(636, 140)
+
 
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else "/output/entry.png"
-    draw()
-    write_png(out)
+    path = sys.argv[1] if len(sys.argv) > 1 else "/output/entry.png"
+    draw_kitten()
+    write_png(path)
+
 
 if __name__ == "__main__":
     main()
